@@ -133,6 +133,7 @@ use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::LockedWorkingCopy;
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::working_copy::SnapshotStats;
+use jj_lib::working_copy::SnapshotWarning;
 use jj_lib::working_copy::UntrackedReason;
 use jj_lib::working_copy::WorkingCopy;
 use jj_lib::working_copy::WorkingCopyFactory;
@@ -223,31 +224,14 @@ pub struct TracingSubscription {
 
 impl TracingSubscription {
     const ENV_VAR_NAME: &str = "JJ_LOG";
-    const DEFAULT_LOG_DIRECTIVES: &[&str] = &["jj_lib::local_working_copy=warn"];
-    const DEBUG_LOG_DIRECTIVES: &[&str] = &["jj_lib=debug", "jj_cli=debug"];
-
-    fn build_log_filter(
-        default_level: tracing::metadata::LevelFilter,
-        directives: &[&str],
-        env_filter: Option<&str>,
-    ) -> tracing_subscriber::EnvFilter {
-        directives.iter().fold(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(default_level.into())
-                .parse_lossy(env_filter.unwrap_or_default()),
-            |filter, directive| filter.add_directive(directive.parse().unwrap()),
-        )
-    }
 
     /// Initializes tracing with the default configuration. This should be
     /// called as early as possible.
     pub fn init() -> Self {
-        let env_filter = std::env::var(Self::ENV_VAR_NAME).ok();
-        let filter = Self::build_log_filter(
-            tracing::metadata::LevelFilter::ERROR,
-            Self::DEFAULT_LOG_DIRECTIVES,
-            env_filter.as_deref(),
-        );
+        let filter = tracing_subscriber::EnvFilter::builder()
+            .with_default_directive(tracing::metadata::LevelFilter::ERROR.into())
+            .with_env_var(Self::ENV_VAR_NAME)
+            .from_env_lossy();
         let (filter, reload_log_filter) = tracing_subscriber::reload::Layer::new(filter);
 
         let (chrome_tracing_layer, chrome_tracing_flush_guard) = match std::env::var("JJ_TRACE") {
@@ -298,12 +282,12 @@ impl TracingSubscription {
                 // The default is INFO.
                 // jj-lib and jj-cli are whitelisted for DEBUG logging.
                 // This ensures that other crates' logging doesn't show up by default.
-                let env_filter = std::env::var(Self::ENV_VAR_NAME).ok();
-                *filter = Self::build_log_filter(
-                    tracing::metadata::LevelFilter::INFO,
-                    Self::DEBUG_LOG_DIRECTIVES,
-                    env_filter.as_deref(),
-                );
+                *filter = tracing_subscriber::EnvFilter::builder()
+                    .with_default_directive(tracing::metadata::LevelFilter::INFO.into())
+                    .with_env_var(Self::ENV_VAR_NAME)
+                    .from_env_lossy()
+                    .add_directive("jj_lib=debug".parse().unwrap())
+                    .add_directive("jj_cli=debug".parse().unwrap());
             })
             .map_err(|err| internal_error_with_message("failed to enable debug logging", err))?;
         tracing::info!("debug logging enabled");
@@ -650,10 +634,15 @@ impl CommandHelper {
                     .map_err(|err| err.into_command_error())?;
                 let merged_stats = {
                     let SnapshotStats {
+                        mut warnings,
                         mut untracked_paths,
                     } = stale_stats;
+                    warnings.extend(fresh_stats.warnings);
                     untracked_paths.extend(fresh_stats.untracked_paths);
-                    SnapshotStats { untracked_paths }
+                    SnapshotStats {
+                        warnings,
+                        untracked_paths,
+                    }
                 };
                 Ok((workspace_command, merged_stats))
             }
@@ -3010,11 +2999,27 @@ pub fn print_untracked_files(
     Ok(())
 }
 
+pub fn print_snapshot_warnings(ui: &Ui, warnings: &[SnapshotWarning]) -> io::Result<()> {
+    for warning in warnings {
+        match warning {
+            SnapshotWarning::FileSystemMonitor { message } => {
+                writeln!(ui.warning_default(), "Failed to query filesystem monitor:")?;
+                let mut formatter = ui.stderr_formatter();
+                for line in message.lines() {
+                    writeln!(formatter, "  {line}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn print_snapshot_stats(
     ui: &Ui,
     stats: &SnapshotStats,
     path_converter: &RepoPathUiConverter,
 ) -> io::Result<()> {
+    print_snapshot_warnings(ui, &stats.warnings)?;
     print_untracked_files(ui, &stats.untracked_paths, path_converter)?;
 
     let large_files_sizes = stats
@@ -4508,13 +4513,7 @@ fn warn_if_args_mismatch(
 
 #[cfg(test)]
 mod tests {
-    use std::io;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
     use clap::CommandFactory as _;
-    use tracing_subscriber::fmt::MakeWriter;
-    use tracing_subscriber::prelude::*;
 
     use super::*;
 
@@ -4526,36 +4525,6 @@ mod tests {
         pub bar: Vec<u32>,
         #[arg(long)]
         pub baz: bool,
-    }
-
-    #[derive(Clone, Default)]
-    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
-
-    impl SharedBuffer {
-        fn contents(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    struct SharedBufferWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for SharedBufferWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for SharedBuffer {
-        type Writer = SharedBufferWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            SharedBufferWriter(self.0.clone())
-        }
     }
 
     #[test]
@@ -4581,30 +4550,5 @@ mod tests {
             parse(&["jj", "--foo=1", "--baz", "--bar=2", "--foo", "3"]),
             vec![("foo", 1), ("bar", 2), ("foo", 3)]
         );
-    }
-
-    #[test]
-    fn test_default_logging_includes_watchman_warnings() {
-        let stderr = SharedBuffer::default();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .without_time()
-                .with_ansi(false)
-                .with_writer(stderr.clone())
-                .with_filter(TracingSubscription::build_log_filter(
-                    tracing::metadata::LevelFilter::ERROR,
-                    TracingSubscription::DEFAULT_LOG_DIRECTIVES,
-                    None,
-                )),
-        );
-
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::warn!(target: "jj_lib::local_working_copy", "watchman warning");
-            tracing::warn!(target: "jj_lib::lock::fallback", "unrelated warning");
-        });
-
-        let output = stderr.contents();
-        assert!(output.contains("watchman warning"));
-        assert!(!output.contains("unrelated warning"));
     }
 }
