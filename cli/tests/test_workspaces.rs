@@ -256,7 +256,13 @@ fn test_workspaces_status_in_linked_git_worktree_does_not_auto_import_git_refs()
 
     let git_repo = git::open(main_dir.root());
     let commit_id = main_dir
-        .run_jj(["--ignore-working-copy", "log", "-Tcommit_id", "--no-graph", "-r@"])
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "-Tcommit_id",
+            "--no-graph",
+            "-r@",
+        ])
         .success()
         .stdout
         .into_raw();
