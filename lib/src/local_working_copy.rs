@@ -1199,12 +1199,13 @@ impl TreeState {
         let previous_clock = self.watchman_clock.clone().map(watchman::Clock::from);
 
         let tokio_fn = async || {
-            let fsmonitor = watchman::Fsmonitor::init(&self.working_copy_path, config)
-                .await
-                .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))?;
-            fsmonitor
-                .query_changed_files(previous_clock)
-                .await
+            let result = async {
+                let fsmonitor = watchman::Fsmonitor::init(&self.working_copy_path, config).await?;
+                fsmonitor.query_changed_files(previous_clock).await
+            }
+            .await;
+            result
+                .inspect_err(|err| tracing::warn!(?err, "Watchman query failed"))
                 .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))
         };
 
@@ -1227,12 +1228,13 @@ impl TreeState {
         config: &WatchmanConfig,
     ) -> Result<bool, TreeStateError> {
         let tokio_fn = async || {
-            let fsmonitor = watchman::Fsmonitor::init(&self.working_copy_path, config)
-                .await
-                .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))?;
-            fsmonitor
-                .is_trigger_registered()
-                .await
+            let result = async {
+                let fsmonitor = watchman::Fsmonitor::init(&self.working_copy_path, config).await?;
+                fsmonitor.is_trigger_registered().await
+            }
+            .await;
+            result
+                .inspect_err(|err| tracing::warn!(?err, "Watchman trigger query failed"))
                 .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))
         };
 
@@ -1393,10 +1395,7 @@ impl TreeState {
             #[cfg(feature = "watchman")]
             FsmonitorSettings::Watchman(config) => match self.query_watchman(config).await {
                 Ok((watchman_clock, changed_files)) => (Some(watchman_clock.into()), changed_files),
-                Err(err) => {
-                    tracing::warn!(?err, "Failed to query filesystem monitor");
-                    (None, None)
-                }
+                Err(_err) => (None, None),
             },
             #[cfg(not(feature = "watchman"))]
             FsmonitorSettings::Watchman(_) => {
