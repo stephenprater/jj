@@ -234,7 +234,6 @@ pub mod watchman {
         pub async fn query_changed_files(
             &self,
             previous_clock: Option<Clock>,
-            ignored_dirs: &[PathBuf],
         ) -> Result<(Clock, Option<Vec<PathBuf>>), Error> {
             // TODO: might be better to specify query options by caller, but we
             // shouldn't expose the underlying watchman API too much.
@@ -255,7 +254,7 @@ pub mod watchman {
                     &self.resolved_root,
                     QueryRequestCommon {
                         since: previous_clock.map(|Clock(clock)| clock),
-                        expression: Some(build_exclude_expr(ignored_dirs)),
+                        expression: Some(build_exclude_expr()),
                         ..Default::default()
                     },
                 )
@@ -309,7 +308,7 @@ pub mod watchman {
                             "util".to_string(),
                             "snapshot".to_string(),
                         ],
-                        expression: Some(build_exclude_expr(&[])),
+                        expression: Some(build_exclude_expr()),
                         stderr: Some(null.into()),
                         stdout: Some(null.into()),
                         ..Default::default()
@@ -333,60 +332,23 @@ pub mod watchman {
     }
 
     /// Build an exclude expr for `working_copy_path`.
-    fn build_exclude_expr(ignored_dirs: &[PathBuf]) -> expr::Expr {
-        let exclude_dirs = [Path::new(".git"), Path::new(".jj")]
-            .into_iter()
-            .map(Path::to_owned)
-            .chain(ignored_dirs.iter().cloned())
-            .collect_vec();
+    fn build_exclude_expr() -> expr::Expr {
+        let exclude_dirs = [Path::new(".git"), Path::new(".jj")];
         let excludes = itertools::chain(
             // the directories themselves
             [expr::Expr::Name(expr::NameTerm {
-                paths: exclude_dirs.clone(),
+                paths: exclude_dirs.iter().map(|&name| name.to_owned()).collect(),
                 wholename: true,
             })],
             // and all files under the directories
-            exclude_dirs.into_iter().map(|name| {
+            exclude_dirs.iter().map(|&name| {
                 expr::Expr::DirName(expr::DirNameTerm {
-                    path: name,
+                    path: name.to_owned(),
                     depth: None,
                 })
             }),
         )
         .collect();
         expr::Expr::Not(Box::new(expr::Expr::Any(excludes)))
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_build_exclude_expr_includes_extra_dirs() {
-            let ignored_dir = PathBuf::from("ignored");
-            let expr::Expr::Not(child) = build_exclude_expr(std::slice::from_ref(&ignored_dir))
-            else {
-                panic!("unexpected expression shape");
-            };
-            let expr::Expr::Any(excludes) = *child else {
-                panic!("unexpected expression shape");
-            };
-
-            assert!(matches!(
-                &excludes[0],
-                expr::Expr::Name(expr::NameTerm { paths, wholename: true })
-                    if paths
-                        == &vec![
-                            PathBuf::from(".git"),
-                            PathBuf::from(".jj"),
-                            ignored_dir.clone(),
-                        ]
-            ));
-            assert!(excludes.iter().any(|term| matches!(
-                term,
-                expr::Expr::DirName(expr::DirNameTerm { path, depth: None })
-                    if path == &ignored_dir
-            )));
-        }
     }
 }

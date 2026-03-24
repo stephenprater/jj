@@ -1202,24 +1202,12 @@ impl TreeState {
         &self,
         config: &WatchmanConfig,
     ) -> Result<(watchman::Clock, Option<Vec<PathBuf>>), TreeStateError> {
-        self.query_watchman_with_ignored_dirs(config, &[]).await
-    }
-
-    #[cfg(feature = "watchman")]
-    #[instrument(skip(self, ignored_dirs))]
-    async fn query_watchman_with_ignored_dirs(
-        &self,
-        config: &WatchmanConfig,
-        ignored_dirs: &[PathBuf],
-    ) -> Result<(watchman::Clock, Option<Vec<PathBuf>>), TreeStateError> {
         let previous_clock = self.watchman_clock.clone().map(watchman::Clock::from);
 
         let tokio_fn = async || {
             let result = async {
                 let fsmonitor = watchman::Fsmonitor::init(&self.working_copy_path, config).await?;
-                fsmonitor
-                    .query_changed_files(previous_clock, ignored_dirs)
-                    .await
+                fsmonitor.query_changed_files(previous_clock).await
             }
             .await;
             result
@@ -1243,109 +1231,6 @@ impl TreeState {
                 runtime.block_on(tokio_fn())
             }
         }
-    }
-
-    #[cfg(feature = "watchman")]
-    fn collect_watchman_ignored_dirs(
-        &self,
-        base_ignores: &Arc<GitIgnoreFile>,
-    ) -> Result<Vec<PathBuf>, SnapshotError> {
-        let git_ignore =
-            base_ignores.chain_with_file("", self.working_copy_path.join(".gitignore"))?;
-        let mut ignored_dirs = Vec::new();
-        self.collect_watchman_ignored_dirs_in_dir(
-            RepoPath::root(),
-            &self.working_copy_path,
-            git_ignore,
-            self.file_states.all(),
-            &mut ignored_dirs,
-        )?;
-        ignored_dirs.sort();
-        ignored_dirs.dedup();
-        Ok(ignored_dirs)
-    }
-
-    #[cfg(feature = "watchman")]
-    fn collect_watchman_ignored_dirs_in_dir(
-        &self,
-        dir: &RepoPath,
-        disk_dir: &Path,
-        git_ignore: Arc<GitIgnoreFile>,
-        file_states: FileStates<'_>,
-        ignored_dirs: &mut Vec<PathBuf>,
-    ) -> Result<(), SnapshotError> {
-        let dir_entries = match disk_dir.read_dir() {
-            Ok(entries) => entries,
-            Err(err) => {
-                tracing::debug!(
-                    ?err,
-                    path = %disk_dir.display(),
-                    "Failed to read directory while collecting watchman ignored directories"
-                );
-                return Ok(());
-            }
-        };
-        for entry_result in dir_entries {
-            let entry = match entry_result {
-                Ok(entry) => entry,
-                Err(err) => {
-                    tracing::debug!(
-                        ?err,
-                        path = %disk_dir.display(),
-                        "Failed to read directory entry while collecting watchman ignored directories"
-                    );
-                    continue;
-                }
-            };
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(err) => {
-                    tracing::debug!(
-                        ?err,
-                        path = %entry.path().display(),
-                        "Failed to stat directory entry while collecting watchman ignored directories"
-                    );
-                    continue;
-                }
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-
-            let name_string = match entry.file_name().into_string() {
-                Ok(name) => name,
-                Err(_) => continue,
-            };
-            if RESERVED_DIR_NAMES.contains(&name_string.as_str()) {
-                continue;
-            }
-            let name = RepoPathComponent::new(&name_string).unwrap();
-            let path = dir.join(name);
-            let child_file_states = file_states.prefixed_at(dir, name);
-            let child_ignored = git_ignore.matches(&path.to_internal_dir_string());
-            if child_ignored && child_file_states.is_empty() {
-                ignored_dirs.push(path.to_fs_path_unchecked(Path::new("")));
-                continue;
-            }
-
-            let child_disk_dir = entry.path();
-            let child_git_ignore = if child_ignored {
-                git_ignore.clone()
-            } else {
-                git_ignore.chain_with_file(
-                    &path.to_internal_dir_string(),
-                    child_disk_dir.join(".gitignore"),
-                )?
-            };
-            self.collect_watchman_ignored_dirs_in_dir(
-                &path,
-                &child_disk_dir,
-                child_git_ignore,
-                child_file_states,
-                ignored_dirs,
-            )?;
-        }
-        Ok(())
     }
 
     #[cfg(feature = "watchman")]
@@ -1409,9 +1294,7 @@ impl TreeState {
             matcher: fsmonitor_matcher,
             watchman_clock,
             warning: snapshot_warning,
-        } = self
-            .make_fsmonitor_matcher(&self.fsmonitor_settings, base_ignores)
-            .await?;
+        } = self.make_fsmonitor_matcher(&self.fsmonitor_settings).await?;
         let fsmonitor_matcher = match fsmonitor_matcher.as_ref() {
             None => &EverythingMatcher,
             Some(fsmonitor_matcher) => fsmonitor_matcher.as_ref(),
@@ -1523,33 +1406,24 @@ impl TreeState {
     async fn make_fsmonitor_matcher(
         &self,
         fsmonitor_settings: &FsmonitorSettings,
-        base_ignores: &Arc<GitIgnoreFile>,
     ) -> Result<FsmonitorMatcher, SnapshotError> {
-        #[cfg(not(feature = "watchman"))]
-        let _ = base_ignores;
         let (watchman_clock, changed_files, warning) = match fsmonitor_settings {
             FsmonitorSettings::None => (None, None, None),
             FsmonitorSettings::Test { changed_files } => (None, Some(changed_files.clone()), None),
             #[cfg(feature = "watchman")]
-            FsmonitorSettings::Watchman(config) => {
-                let ignored_dirs = self.collect_watchman_ignored_dirs(base_ignores)?;
-                match self
-                    .query_watchman_with_ignored_dirs(config, &ignored_dirs)
-                    .await
-                {
-                    Ok((watchman_clock, changed_files)) => {
-                        (Some(watchman_clock.into()), changed_files, None)
-                    }
-                    Err(TreeStateError::Fsmonitor { user_message, .. }) => (
-                        None,
-                        None,
-                        Some(SnapshotWarning::FileSystemMonitor {
-                            message: user_message,
-                        }),
-                    ),
-                    Err(_err) => (None, None, None),
+            FsmonitorSettings::Watchman(config) => match self.query_watchman(config).await {
+                Ok((watchman_clock, changed_files)) => {
+                    (Some(watchman_clock.into()), changed_files, None)
                 }
-            }
+                Err(TreeStateError::Fsmonitor { user_message, .. }) => (
+                    None,
+                    None,
+                    Some(SnapshotWarning::FileSystemMonitor {
+                        message: user_message,
+                    }),
+                ),
+                Err(_err) => (None, None, None),
+            },
             #[cfg(not(feature = "watchman"))]
             FsmonitorSettings::Watchman(_) => {
                 return Err(SnapshotError::Other {
